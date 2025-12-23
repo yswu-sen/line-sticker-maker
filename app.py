@@ -1,14 +1,15 @@
 import streamlit as st
 import random
-from PIL import Image, ImageFilter, ImageChops
+from PIL import Image, ImageFilter, ImageOps
 import numpy as np
 import io
 import zipfile
+import cv2  # 新增: 用於智慧偵測輪廓
 
 # --- 設定頁面 ---
-st.set_page_config(page_title="Line 貼圖工廠 V3.8 (全覽+強化去邊)", layout="wide")
+st.set_page_config(page_title="Line 貼圖工廠 V4.0 (智慧切圖版)", layout="wide")
 
-# --- 1. 貼圖常用語資料庫 ---
+# --- 1. 貼圖常用語資料庫 (維持不變) ---
 STICKER_CATEGORIES = {
     "日常問候": ["早安", "安安", "抱歉假日打擾", "晚安瑪卡巴卡", "睡了沒？", "在嗎？", "呷霸沒", "撤！", "回家囉", "已出門", "到家！", "在路上", "修但幾勒", "放假~", "開工啦", "哈囉", "Bye Bye"],
     "工作職場": ["收到", "了解", "我看看", "處理中", "快好了", "鶴", "好勒", "沒問題", "金都蝦", "辛苦了", "這裡有Bug", "開會中", "不想上班", "會後討論", "開不完的會", "加班命…", "請幫確認", "麻煩您！", "感謝支援～", "坐等下班", "我愛(ㄏㄣˋ)工作", "可以"],
@@ -35,45 +36,31 @@ ART_STYLES = {
 }
 
 # --- 3. 輔助函式 ---
+
 def add_black_border(input_image, thickness=3):
     """為圖片加上黑色邊框"""
     img = input_image.convert("RGBA")
-    # 取得 Alpha 通道作為遮罩
     mask = img.getchannel('A')
-    
-    # 擴張遮罩 (Dilation) 來製作邊框區域
-    # MaxFilter 會讓白色區域變大，模擬擴張效果
     dilated_mask = mask.filter(ImageFilter.MaxFilter(thickness * 2 + 1))
-    
-    # 建立純黑背景
     black_bg = Image.new('RGBA', img.size, (0, 0, 0, 255))
     output_img = Image.new('RGBA', img.size, (0, 0, 0, 0))
-    
-    # 先貼上黑色擴張後的樣子
     output_img.paste(black_bg, mask=dilated_mask)
-    # 再貼上原圖
     output_img.paste(img, (0, 0), img)
-    
     return output_img
 
 def erode_edges(input_image, pixels=1):
     """侵蝕邊緣 (消除綠邊關鍵)"""
     if pixels <= 0: return input_image
-    
     img = input_image.convert("RGBA")
     r, g, b, a = img.split()
-    
-    # 使用 MinFilter 進行侵蝕 (讓 Alpha 通道縮小)
-    # 奇數 filter size: 3=侵蝕1px, 5=侵蝕2px
     filter_size = pixels * 2 + 1 
     new_a = a.filter(ImageFilter.MinFilter(filter_size))
-    
-    # 重新組合
     img.putalpha(new_a)
     return img
 
 def generate_dynamic_prompt(phrases, style_desc):
     phrases_str = "、".join(phrases)
+    # 修改重點：光影設定移除 "Sticker Style" 改為更細緻的描述
     lighting_prompt = "平面光照(Flat Lighting)，背景無陰影(No Shadow)，"
     
     prompt = f"""
@@ -81,7 +68,11 @@ def generate_dynamic_prompt(phrases, style_desc):
 [角色與風格]:
 - 必須維持原圖主角的特徵。
 - 風格設定：【{style_desc}】。
-- 光影設定：{lighting_prompt} 角色與文字外圍皆需加入粗白色外框(Sticker Style)。
+- **重要設計規範**：
+  1. **角色圖案**：**不要描邊 (No Outline)**，保持純粹的繪圖/插畫邊緣，不要有白邊。
+  2. **文字設計**：**必須有粗白色外框 (Thick White Outline)**，確保在深色背景也能閱讀。
+  3. **間距**：每個貼圖之間請保持足夠的綠色空隙 (Generous spacing)，不要重疊。
+- 光影設定：{lighting_prompt}。
 - 背景：統一為 #00FF00 (純綠色)，不可有雜點。
 - 佈局：先橫後直4x3 佈局，共12張，總尺寸 1480x960 px。
 
@@ -89,77 +80,120 @@ def generate_dynamic_prompt(phrases, style_desc):
 請使用以下隨機選出的12組文字，並搭配對應的情境動作(切勿重複)：
 【{phrases_str}】
 
-[設計規範]:
-- 文字語言：台灣繁體中文。
-- 字型：配合畫風的設計字體，顏色鮮豔高對比，**絕對禁止綠色與黑色**。
-- 表情與動作：需誇張且與文字情境一致。
-- 輸出：一張大圖，內含12張貼圖，綠底去背友善。
+[輸出]:
+一張大圖，內含12張貼圖，綠底去背友善。
 """ 
     return prompt
 
+def sort_contours_grid(cnts, method="left-to-right"):
+    """
+    智慧排序輪廓：
+    將偵測到的貼圖依照 4x3 的閱讀順序（左到右，上到下）進行排序。
+    """
+    boundingBoxes = [cv2.boundingRect(c) for c in cnts]
+    (cnts, boundingBoxes) = zip(*sorted(zip(cnts, boundingBoxes),
+        key=lambda b: b[1][1], reverse=False)) # 先依 Y 軸排序
+
+    # 簡單的分組邏輯：如果 Y 差異不大，視為同一行
+    rows = []
+    current_row = []
+    last_y = -999
+    
+    for (cnt, bbox) in zip(cnts, boundingBoxes):
+        x, y, w, h = bbox
+        if abs(y - last_y) > 100: # 如果 Y 差超過 100px，視為新的一行
+            if current_row:
+                # 這一行結束，對這一行內的元素依 X 軸排序
+                current_row.sort(key=lambda z: z[1][0])
+                rows.extend(current_row)
+            current_row = [(cnt, bbox)]
+            last_y = y
+        else:
+            current_row.append((cnt, bbox))
+            
+    if current_row:
+        current_row.sort(key=lambda z: z[1][0])
+        rows.extend(current_row)
+
+    return [r[0] for r in rows]
+
 def process_sticker_grid(image_file, green_threshold=150, color_tolerance=100, enable_erode=0, border_thickness=0):
-    """處理圖片核心邏輯"""
+    """
+    處理圖片核心邏輯 (升級版：使用 OpenCV 智慧偵測輪廓，解決切邊問題)
+    """
+    # 1. 讀取並轉為 RGBA
     img = Image.open(image_file).convert("RGBA")
     
-    target_size = (1480, 960)
-    if img.size != target_size:
-        img = img.resize(target_size, Image.Resampling.LANCZOS)
-
+    # 2. 轉為 Numpy 陣列進行去背
     data = np.array(img)
     red, green, blue, alpha = data.T
     
-    # 1. 執行基礎去背
+    # 綠色去背邏輯
     green_areas = (green > green_threshold) & (red < color_tolerance) & (blue < color_tolerance)
     data[..., 3][green_areas.T] = 0
     
+    # 取得去背後的 Alpha 通道圖 (用於偵測輪廓)
     result_img = Image.fromarray(data)
+    alpha_channel = data[..., 3].astype(np.uint8)
+
+    # 3. OpenCV 輪廓偵測 (Smart Slicing)
+    # 先做一點膨脹 (Dilate) 讓文字和圖案連在一起，避免被切成兩個
+    kernel = np.ones((5,5), np.uint8)
+    dilated_alpha = cv2.dilate(alpha_channel, kernel, iterations=2)
     
-    col_count = 4
-    row_count = 3
-    unit_w = 1480 // col_count 
-    unit_h = 960 // row_count  
+    # 找輪廓
+    contours, _ = cv2.findContours(dilated_alpha, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
+    # 過濾太小的雜點 (面積小於 2000 px 視為雜訊)
+    valid_contours = [c for c in contours if cv2.contourArea(c) > 2000]
+    
+    # 排序：確保順序是左上 -> 右下 (符合 1~12 的順序)
+    sorted_contours = sort_contours_grid(valid_contours)
+    
+    # 目標單張貼圖尺寸
+    unit_w, unit_h = 370, 320 # 1480/4, 960/3 的約略值
     stickers = []
     
-    for r in range(row_count):
-        for c in range(col_count):
-            left = c * unit_w
-            upper = r * unit_h
-            right = left + unit_w
-            lower = upper + unit_h
-            
-            cell_crop = result_img.crop((left, upper, right, lower))
-            final_canvas = Image.new("RGBA", (unit_w, unit_h), (0, 0, 0, 0))
-            bbox = cell_crop.getbbox()
-            
-            if bbox:
-                content_img = cell_crop.crop(bbox)
-                
-                # --- 新增：邊緣處理流程 ---
-                # A. 侵蝕 (Erode) - 向內縮小，切掉綠邊
-                if enable_erode > 0:
-                    content_img = erode_edges(content_img, pixels=enable_erode)
-                
-                # B. 加框 (Border) - 在處理完邊緣後加上黑框
-                if border_thickness > 0:
-                    content_img = add_black_border(content_img, thickness=border_thickness)
-                
-                # --- 尺寸調整與置中 ---
-                c_w, c_h = content_img.size
-                if c_w > unit_w or c_h > unit_h:
-                    content_img.thumbnail((unit_w, unit_h), Image.Resampling.LANCZOS)
-                    c_w, c_h = content_img.size 
+    # 4. 針對每個偵測到的輪廓進行裁切
+    # 為了安全，我們只取前 12 個大的輪廓 (避免多切)
+    for cnt in sorted_contours[:12]:
+        x, y, w, h = cv2.boundingRect(cnt)
+        
+        # 這裡從 result_img (已去背) 裁切
+        content_img = result_img.crop((x, y, x+w, y+h))
+        
+        # --- 邊緣處理流程 ---
+        # A. 侵蝕 (Erode) - 消除邊緣綠色雜訊
+        if enable_erode > 0:
+            content_img = erode_edges(content_img, pixels=enable_erode)
+        
+        # B. 加框 (Border) - 這裡加的是黑色外框
+        if border_thickness > 0:
+            content_img = add_black_border(content_img, thickness=border_thickness)
+        
+        # --- 尺寸調整與置中 ---
+        # 建立透明畫布
+        final_canvas = Image.new("RGBA", (unit_w, unit_h), (0, 0, 0, 0))
+        
+        # 縮放貼圖以適應畫布 (保持比例)
+        content_img.thumbnail((unit_w - 10, unit_h - 10), Image.Resampling.LANCZOS)
+        c_w, c_h = content_img.size 
 
-                paste_x = (unit_w - c_w) // 2
-                paste_y = (unit_h - c_h) // 2
-                final_canvas.paste(content_img, (paste_x, paste_y), content_img)
-            
-            stickers.append(final_canvas)
+        # 置中貼上
+        paste_x = (unit_w - c_w) // 2
+        paste_y = (unit_h - c_h) // 2
+        final_canvas.paste(content_img, (paste_x, paste_y), content_img)
+        
+        stickers.append(final_canvas)
+        
+    # 如果偵測到的少於 12 張，補上空白圖避免報錯
+    while len(stickers) < 12:
+        stickers.append(Image.new("RGBA", (unit_w, unit_h), (0, 0, 0, 0)))
             
     return stickers
 
 # --- Streamlit 主介面 ---
-st.title("🤖 Line 貼圖工廠 V3.8 (全覽+強化去邊)")
+st.title("🤖 Line 貼圖工廠 V4.0 (智慧切圖版)")
 
 # 側邊欄
 st.sidebar.header("1. 角色與風格")
@@ -190,8 +224,8 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔧 後製設定 (進階)")
 green_threshold = st.sidebar.slider("1. 綠色判定閥值", 50, 250, 150, help="數字越大，只有越綠的地方會被去掉")
-erode_level = st.sidebar.slider("2. 邊緣內縮 (px)", 0, 5, 1, help="有效消除綠邊！建議設為 1 或 2，會將邊緣往內切")
-border_thickness = st.sidebar.slider("3. 黑框粗細 (px)", 0, 10, 3, help="設為 0 則不加框")
+erode_level = st.sidebar.slider("2. 邊緣內縮 (px)", 0, 5, 1, help="有效消除綠邊！建議設為 1，會將邊緣往內切")
+border_thickness = st.sidebar.slider("3. 黑框粗細 (px)", 0, 10, 3, help="最後輸出的黑色外框，設為 0 則不加框")
 
 st.sidebar.markdown("---")
 refresh_btn = st.sidebar.button("🔄 重新抽取文字")
@@ -222,10 +256,10 @@ st.markdown("---")
 
 # 區域 2
 st.subheader("2. 上傳 Gemini 結果圖")
-uploaded_file = st.file_uploader("Drag and drop file here", type=['png', 'jpg', 'jpeg'], key="uploader_v3_8")
+uploaded_file = st.file_uploader("請上傳 Gemini 生成的綠底圖", type=['png', 'jpg', 'jpeg'], key="uploader_v4_0")
 
 if uploaded_file:
-    spinner_text = '正在執行去背、內縮邊緣與加框處理...' 
+    spinner_text = '正在執行智慧輪廓偵測、去背與加框...' 
     with st.spinner(spinner_text):
         try:
             stickers = process_sticker_grid(
@@ -234,23 +268,27 @@ if uploaded_file:
                 enable_erode=erode_level, 
                 border_thickness=border_thickness
             )
-            st.success(f"🎉 處理完成！共 {len(stickers)} 張貼圖")
             
-            # --- 修正：全覽顯示 (4欄佈局) ---
-            st.markdown(f"##### 貼圖預覽 (共 {len(stickers)} 張)")
-            cols = st.columns(4) # 建立 4 個欄位
-            for idx, sticker in enumerate(stickers):
-                # 利用餘數 (idx % 4) 決定圖片要放在第幾個欄位
-                with cols[idx % 4]:
-                    st.image(sticker, caption=f"No.{idx+1}", use_column_width=True)
-            
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, "w") as zf:
+            if len(stickers) == 0:
+                st.error("❌ 無法偵測到貼圖，請檢查圖片是否為綠底，或調整綠色判定閥值。")
+            else:
+                st.success(f"🎉 處理完成！成功識別出 {len(stickers)} 張貼圖")
+                
+                # --- 全覽顯示 ---
+                st.markdown(f"##### 貼圖預覽")
+                cols = st.columns(4) 
                 for idx, sticker in enumerate(stickers):
-                    img_byte_arr = io.BytesIO()
-                    sticker.save(img_byte_arr, format='PNG')
-                    zf.writestr(f"sticker_{idx+1:02d}.png", img_byte_arr.getvalue())
-            
-            st.download_button("📥 下載完整貼圖包 (ZIP)", zip_buffer.getvalue(), "stickers.zip", "application/zip", type="primary")
+                    with cols[idx % 4]:
+                        st.image(sticker, caption=f"No.{idx+1}", use_column_width=True)
+                
+                zip_buffer = io.BytesIO()
+                with zipfile.ZipFile(zip_buffer, "w") as zf:
+                    for idx, sticker in enumerate(stickers):
+                        img_byte_arr = io.BytesIO()
+                        sticker.save(img_byte_arr, format='PNG')
+                        zf.writestr(f"sticker_{idx+1:02d}.png", img_byte_arr.getvalue())
+                
+                st.download_button("📥 下載完整貼圖包 (ZIP)", zip_buffer.getvalue(), "stickers.zip", "application/zip", type="primary")
         except Exception as e:
             st.error(f"發生錯誤：{e}")
+            st.markdown("💡 提示：如果出現 `ModuleNotFoundError: No module named 'cv2'`，請確認環境已安裝 `opencv-python`。")
