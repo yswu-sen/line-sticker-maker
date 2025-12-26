@@ -14,13 +14,13 @@ from datetime import datetime
 # 🎨 1. 頁面與 ADI 品牌化 CSS 設定
 # ==========================================
 st.set_page_config(
-    page_title="Line 貼圖工廠 - ADI Edition", 
+    page_title="Line 貼圖半自動產生器", 
     page_icon="🎨", 
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
-# 🌟 CSS 魔術：注入 ADI 品牌規範 + 便利貼特效 + Code Block 修復
+# 🌟 CSS 魔術：注入 ADI 品牌規範 + 便利貼特效 + Code Block 修復 + Hero標題
 st.markdown("""
     <style>
     /* 引入 Poppins 字體 */
@@ -35,6 +35,24 @@ st.markdown("""
     /* 全局背景色 */
     .stApp {
         background-color: #F8F9FA;
+    }
+    
+    /* 🏆 Hero Header (主標題區) */
+    .hero-container {
+        text-align: center;
+        padding: 20px 0 10px 0;
+        margin-bottom: 20px;
+    }
+    .hero-title {
+        font-size: 2.5rem;
+        font-weight: 700;
+        color: #1F323D;
+        margin: 0;
+    }
+    .hero-subtitle {
+        font-size: 1.1rem;
+        color: #5F5F5F;
+        margin-top: 5px;
     }
     
     /* 卡片樣式 */
@@ -128,7 +146,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 🧠 2. 完整資料庫 (🔥 已新增：水墨畫風)
+# 🧠 2. 完整資料庫 (含水墨畫風)
 # ==========================================
 STICKER_CATEGORIES = {
     "日常問候": ["早安", "安安", "抱歉假日打擾", "晚安瑪卡巴卡", "睡了沒？", "在嗎？", "呷霸沒", "撤！", "回家囉", "已出門", "到家！", "在路上", "修但幾勒", "放假~", "開工啦", "哈囉", "Bye Bye"],
@@ -169,7 +187,7 @@ PRESET_COLORS = {
 }
 
 # ==========================================
-# 🛠️ 3. 完整核心演算法 (已恢復所有功能)
+# 🛠️ 3. 完整核心演算法
 # ==========================================
 
 def add_outline(input_image, thickness=1.5, color="#000000"):
@@ -328,7 +346,7 @@ def send_feedback_email(category, user_msg, user_contact):
         except Exception as e:
             return False, f"❌ Email 發送失敗：{e}"
     else:
-        return True, "✅ (模擬模式) 便利貼已貼上！(若有設定 Email 則會同步寄出)"
+        return True, "✅ (模擬模式) 便利貼已貼上！(若有設定 Secrets 則會同步寄出)"
 
 # 初始化留言板資料
 if 'board_messages' not in st.session_state:
@@ -352,6 +370,15 @@ def add_message(category, msg, author):
 # 🖥️ 5. UI 佈局邏輯
 # ==========================================
 
+# 🏆 新增：Hero Header (主視覺標題)
+st.markdown("""
+<div class="hero-container">
+    <h1 class="hero-title">🎨 Line 貼圖半自動產生器</h1>
+    <p class="hero-subtitle">ADI Edition • 專為創作者打造的 AI 輔助工具</p>
+</div>
+""", unsafe_allow_html=True)
+
+# 導覽列
 selected_nav = option_menu(
     menu_title=None, 
     options=["創意生成 (Step 1)", "後製工廠 (Step 2)", "使用說明", "留言板"], 
